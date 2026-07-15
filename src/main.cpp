@@ -1,0 +1,1272 @@
+#include <Arduino.h>
+#include <EEPROM.h>
+#include <cstdlib>
+#include <cstring>
+
+/*
+  Dewater Pump Float Replacement firmware.
+
+  Control channel: PWA <-> device is entirely over BLE (HM-10, `bleUart`).
+  USB `Serial` is debug-log output only, never a command channel.
+
+  Wiring:
+    notecardUart (Serial1): F_TX->N_RX, F_RX->N_TX, F_D5->N_ATTN
+    bleUart (HM-10):        A0<-TXD, A3->RXD, 3V3->VCC, GND->GND
+    (don't wire a USB-serial adapter to A0/A3 while the HM-10 is connected — same pins)
+
+  Notefiles: *.qi = inbound (note.get), *.qo = outbound (note.add).
+
+  First boot: PWA sends setup_device (product_uid + serial_number) then
+  confirm_setup over BLE — see setupPhaseReceiveDeviceConfig(). Later identity
+  changes use set_config at runtime — see tryHandleRuntimeIdentityCommand().
+*/
+
+namespace
+{
+
+  constexpr const char *kFirmwareVersion = "1.0.0";
+
+  // Debug logging over USB Serial, gated by kDebugLogEnabled.
+  constexpr bool kDebugLogEnabled = true;
+
+  template <typename T>
+  inline void dbgPrint(const T &v)
+  {
+    if (kDebugLogEnabled)
+    {
+      Serial.print(v);
+    }
+  }
+
+  template <typename T>
+  inline void dbgPrintln(const T &v)
+  {
+    if (kDebugLogEnabled)
+    {
+      Serial.println(v);
+    }
+  }
+
+  inline void dbgPrintln()
+  {
+    if (kDebugLogEnabled)
+    {
+      Serial.println();
+    }
+  }
+
+  HardwareSerial &notecardUart = Serial1;
+  constexpr uint8_t kNotecardAttnPin = D5;
+
+  // Sole control channel for the PWA.
+  constexpr uint8_t kBleUartRxPin = A0;
+  constexpr uint8_t kBleUartTxPin = A3;
+  HardwareSerial bleUart(kBleUartRxPin, kBleUartTxPin);
+
+  constexpr uint8_t kAdcPin = PA1; // water level sensor
+
+  // Product UID/serial come from the PWA (setup_device) or EEPROM.
+  constexpr const char *kInboundNotefile = "data.qi";   // note.get
+  constexpr const char *kOutboundNotefile = "retrofit.qo"; // note.add
+
+  // Must match this device's id in the app's categories.ts. HM-10 clones don't
+  // reliably support AT+NAME (advertised name stays "HMSoft"), so the app
+  // confirms category via get_config/get_status instead of the BLE name.
+  constexpr const char *kDeviceCategoryId = "dewater-pump-float";
+
+  // Set true to wipe EEPROM on every boot (testing/reflashing only).
+  constexpr bool kClearEepromOnBoot = 1;
+
+  // EEPROM layout:
+  //   [0:0]       0xAA if product UID configured, else 0x00
+  //   [1:128]     Product UID string (null-terminated, max 127 chars)
+  //   [129:129]   0xBB if serial number configured, else 0x00
+  //   [130:257]   Serial Number string (null-terminated, max 127 chars)
+  //   [258:258]   0xCC if retrofit config (below) is configured, else 0x00
+  //   [259:262]   Data send interval, seconds (unsigned long)
+  //   [263:264]   Sensor warm-up time, seconds (uint16_t)
+  //   [265:266]   EMA filter smoothing level (uint16_t)
+  //   [267:267]   BLE/Notecard sync mode: 0 = normal (continuous), 1 = sleep (on-demand)
+  //   [268:291]   6 pumps * (high threshold, low threshold) * 2 bytes (uint16_t each)
+  constexpr uint16_t kEepromFlagAddr = 0;
+  constexpr uint16_t kEepromProductUidAddr = 1;
+  constexpr uint16_t kMaxProductUidLength = 127;
+  constexpr uint8_t kConfiguredFlag = 0xAA;
+
+  constexpr uint16_t kEepromSerialNumFlagAddr = 129;
+  constexpr uint16_t kEepromSerialNumAddr = 130;
+  constexpr uint16_t kMaxSerialNumLength = 127;
+  constexpr uint8_t kSerialNumConfiguredFlag = 0xBB;
+
+  constexpr uint8_t kPumpCount = 6;
+  constexpr uint16_t kEepromRetrofitFlagAddr = 258;
+  constexpr uint8_t kRetrofitConfiguredFlag = 0xCC;
+  constexpr uint16_t kEepromDataIntervalSecAddr = 259; // 4 bytes
+  constexpr uint16_t kEepromSensorInitSecAddr = 263;   // 2 bytes
+  constexpr uint16_t kEepromEmaSampleAddr = 265;       // 2 bytes
+  constexpr uint16_t kEepromBleModeAddr = 267;         // 1 byte
+  constexpr uint16_t kEepromPumpThresholdsAddr = 268;  // 24 bytes: 6 * (high, low) * 2
+
+  char gProductUid[kMaxProductUidLength + 1] = {0};
+  char gSerialNumber[kMaxSerialNumLength + 1] = {0};
+
+  // gSamplePeriodMs is mutable at runtime via set_sample_period; not persisted,
+  // so it resets to the default on power-cycle.
+  constexpr unsigned long kDefaultSamplePeriodMs = 60000;  // 1 minute
+  constexpr unsigned long kMinSamplePeriodMs = 1000;       // floor: avoid flooding the link
+  constexpr unsigned long kMaxSamplePeriodMs = 86400000UL; // 24h ceiling
+  unsigned long gSamplePeriodMs = kDefaultSamplePeriodMs;
+  unsigned long lastSampleMs = 0;
+
+  // Retrofit config below is persisted to EEPROM and mutable via the flat
+  // `{"set_...":"..."}` commands in tryHandleRetrofitCommand.
+  constexpr unsigned long kDefaultDataIntervalSec = kDefaultSamplePeriodMs / 1000;
+  constexpr unsigned long kMinDataIntervalSec = 1;
+  constexpr unsigned long kMaxDataIntervalSec = kMaxSamplePeriodMs / 1000;
+  constexpr uint16_t kDefaultSensorInitSec = 20;
+  constexpr uint16_t kMaxSensorInitSec = 3600;
+  constexpr uint16_t kDefaultEmaSampleN = 200;
+  constexpr uint16_t kMinEmaSampleN = 1;
+  constexpr uint16_t kMaxEmaSampleN = 5000;
+  constexpr uint16_t kAdcMaxValue = 4095;
+
+  unsigned long gDataIntervalSec = kDefaultDataIntervalSec;
+  uint16_t gSensorInitSec = kDefaultSensorInitSec;
+  uint16_t gEmaSampleN = kDefaultEmaSampleN;
+  bool gBleSleepMode = false; // false = normal (continuous sync), true = sleep (on-demand)
+  uint16_t gPumpHighThr[kPumpCount] = {0};
+  uint16_t gPumpLowThr[kPumpCount] = {0};
+
+  // Refreshed continuously by updateAdcFilter(), independent of gSamplePeriodMs
+  // (which only controls how often a sample is reported/sent).
+  int gRawAdcValue = 0;
+  float gFilteredAdcValue = 0.0f;
+  bool gAdcFilterInitialized = false;
+  unsigned long lastEmaSampleMs = 0;
+  constexpr unsigned long kEmaSamplePeriodMs = 250;
+
+  void armNotecardAttn()
+  {
+    char attnCmd[200];
+    snprintf(attnCmd, sizeof(attnCmd),
+             "{\"req\":\"card.attn\",\"mode\":\"arm,files\",\"files\":[\"%s\"]}",
+             kInboundNotefile);
+    notecardUart.println(attnCmd);
+    notecardUart.readStringUntil('\n'); // clear response
+  }
+
+  bool loadProductUidFromEeprom()
+  {
+    uint8_t flag = EEPROM.read(kEepromFlagAddr);
+    if (flag != kConfiguredFlag)
+    {
+      dbgPrintln("-- No stored ProductUID (first-time setup) --");
+      return false;
+    }
+
+    uint16_t addr = kEepromProductUidAddr;
+    uint16_t len = 0;
+    while (len < kMaxProductUidLength)
+    {
+      char c = EEPROM.read(addr + len);
+      gProductUid[len] = c;
+      if (c == '\0')
+      {
+        dbgPrint("Loaded ProductUID from EEPROM: ");
+        dbgPrintln(gProductUid);
+        return true;
+      }
+      len++;
+    }
+
+    dbgPrintln("ERROR: ProductUID in EEPROM is not null-terminated");
+    return false;
+  }
+
+  void saveProductUidToEeprom(const char *uid)
+  {
+    if (uid == nullptr || uid[0] == '\0')
+    {
+      dbgPrintln("ERROR: Cannot save empty ProductUID");
+      return;
+    }
+
+    size_t len = strlen(uid);
+    if (len > kMaxProductUidLength)
+    {
+      dbgPrint("ERROR: ProductUID too long (max ");
+      dbgPrint(kMaxProductUidLength);
+      dbgPrintln(" chars)");
+      return;
+    }
+
+    // Write string + null, then clear the tail (avoid stale chars if the new value is shorter).
+    for (size_t i = 0; i <= len; i++)
+    {
+      EEPROM.write(kEepromProductUidAddr + i, uid[i]);
+    }
+    for (size_t i = len + 1; i <= kMaxProductUidLength; i++)
+    {
+      EEPROM.write(kEepromProductUidAddr + i, 0);
+    }
+
+    EEPROM.write(kEepromFlagAddr, kConfiguredFlag);
+
+    strcpy(gProductUid, uid);
+    dbgPrint("Saved ProductUID to EEPROM: ");
+    dbgPrintln(gProductUid);
+  }
+
+  void clearProductUidEeprom()
+  {
+    EEPROM.write(kEepromFlagAddr, 0x00);
+    memset(gProductUid, 0, sizeof(gProductUid));
+    dbgPrintln("Cleared ProductUID from EEPROM");
+  }
+
+  bool loadSerialNumberFromEeprom()
+  {
+    uint8_t flag = EEPROM.read(kEepromSerialNumFlagAddr);
+    if (flag != kSerialNumConfiguredFlag)
+    {
+      dbgPrintln("-- No stored SerialNumber --");
+      return false;
+    }
+
+    uint16_t addr = kEepromSerialNumAddr;
+    uint16_t len = 0;
+    while (len < kMaxSerialNumLength)
+    {
+      char c = EEPROM.read(addr + len);
+      gSerialNumber[len] = c;
+      if (c == '\0')
+      {
+        dbgPrint("Loaded SerialNumber from EEPROM: ");
+        dbgPrintln(gSerialNumber);
+        return true;
+      }
+      len++;
+    }
+
+    dbgPrintln("ERROR: SerialNumber in EEPROM is not null-terminated");
+    return false;
+  }
+
+  void saveSerialNumberToEeprom(const char *sn)
+  {
+    if (sn == nullptr || sn[0] == '\0')
+    {
+      dbgPrintln("ERROR: Cannot save empty SerialNumber");
+      return;
+    }
+
+    size_t len = strlen(sn);
+    if (len > kMaxSerialNumLength)
+    {
+      dbgPrint("ERROR: SerialNumber too long (max ");
+      dbgPrint(kMaxSerialNumLength);
+      dbgPrintln(" chars)");
+      return;
+    }
+
+    // Write string + null, then clear the tail (avoid stale chars if the new value is shorter).
+    for (size_t i = 0; i <= len; i++)
+    {
+      EEPROM.write(kEepromSerialNumAddr + i, sn[i]);
+    }
+    for (size_t i = len + 1; i <= kMaxSerialNumLength; i++)
+    {
+      EEPROM.write(kEepromSerialNumAddr + i, 0);
+    }
+
+    EEPROM.write(kEepromSerialNumFlagAddr, kSerialNumConfiguredFlag);
+
+    strcpy(gSerialNumber, sn);
+    dbgPrint("Saved SerialNumber to EEPROM: ");
+    dbgPrintln(gSerialNumber);
+  }
+
+  void clearSerialNumberEeprom()
+  {
+    EEPROM.write(kEepromSerialNumFlagAddr, 0x00);
+    memset(gSerialNumber, 0, sizeof(gSerialNumber));
+    dbgPrintln("Cleared SerialNumber from EEPROM");
+  }
+
+  void clearAllConfigEeprom()
+  {
+    clearProductUidEeprom();
+    clearSerialNumberEeprom();
+    EEPROM.write(kEepromRetrofitFlagAddr, 0x00); // re-initializes with defaults on next boot
+    dbgPrintln("Cleared ALL config from EEPROM");
+  }
+
+  void savePumpThresholdToEeprom(uint8_t pumpIdx, bool isHigh, uint16_t value)
+  {
+    const uint16_t addr = kEepromPumpThresholdsAddr + (pumpIdx * 4) + (isHigh ? 0 : 2);
+    EEPROM.put(addr, value);
+  }
+
+  void saveRetrofitConfigToEeprom()
+  {
+    EEPROM.put(kEepromDataIntervalSecAddr, gDataIntervalSec);
+    EEPROM.put(kEepromSensorInitSecAddr, gSensorInitSec);
+    EEPROM.put(kEepromEmaSampleAddr, gEmaSampleN);
+    EEPROM.write(kEepromBleModeAddr, gBleSleepMode ? 1 : 0);
+    for (uint8_t i = 0; i < kPumpCount; i++)
+    {
+      savePumpThresholdToEeprom(i, true, gPumpHighThr[i]);
+      savePumpThresholdToEeprom(i, false, gPumpLowThr[i]);
+    }
+    EEPROM.write(kEepromRetrofitFlagAddr, kRetrofitConfiguredFlag);
+  }
+
+  // Writes+loads defaults on first boot (flag byte not yet set).
+  void loadRetrofitConfigFromEeprom()
+  {
+    if (EEPROM.read(kEepromRetrofitFlagAddr) != kRetrofitConfiguredFlag)
+    {
+      dbgPrintln("-- No stored retrofit config, writing defaults --");
+      saveRetrofitConfigToEeprom();
+      return;
+    }
+
+    EEPROM.get(kEepromDataIntervalSecAddr, gDataIntervalSec);
+    EEPROM.get(kEepromSensorInitSecAddr, gSensorInitSec);
+    EEPROM.get(kEepromEmaSampleAddr, gEmaSampleN);
+    gBleSleepMode = (EEPROM.read(kEepromBleModeAddr) == 1);
+    for (uint8_t i = 0; i < kPumpCount; i++)
+    {
+      const uint16_t addr = kEepromPumpThresholdsAddr + (i * 4);
+      EEPROM.get(addr, gPumpHighThr[i]);
+      EEPROM.get(addr + 2, gPumpLowThr[i]);
+    }
+    dbgPrintln("Loaded retrofit config from EEPROM");
+  }
+
+  void sendGetConfigJsonTo(Print &port)
+  {
+    port.print("{\"status\":\"ok\",\"category\":\"");
+    port.print(kDeviceCategoryId);
+    port.print("\",\"product_uid\":\"");
+    port.print(gProductUid);
+    port.print("\",\"serial_number\":\"");
+    port.print(gSerialNumber);
+    port.print("\",\"sample_period_ms\":");
+    port.print(gSamplePeriodMs);
+    port.println("}");
+  }
+
+  // All tryHandle*Command(s) below follow the same contract: return true (and
+  // reply on `reply`) if `line` matched and was handled, else return false so
+  // the next handler in the chain (see loop()) can try.
+
+  bool tryHandleGetConfigLine(const String &line, Print &replyPort)
+  {
+    if (line.indexOf("\"cmd\":\"get_config\"") == -1)
+    {
+      return false;
+    }
+    sendGetConfigJsonTo(replyPort);
+    return true;
+  }
+
+  bool extractJsonStringValue(const String &line, const char *keyWithQuotes, String &out);
+  bool extractJsonNumberValue(const String &line, const char *keyWithColon, unsigned long &out);
+  bool extractJsonRawValue(const String &line, const char *keyWithColon, String &out);
+
+  void sendStatusJsonTo(Print &port)
+  {
+    // Integer millivolt arithmetic to avoid float.
+    const int adc = analogRead(kAdcPin);
+    const int adcMv = ((long)adc * 3300) / 4095;
+    char adcVoltStr[12];
+    snprintf(adcVoltStr, sizeof(adcVoltStr), "%d.%03d", adcMv / 1000, adcMv % 1000);
+
+    notecardUart.println("{\"req\":\"card.voltage\"}");
+    const String voltResp = notecardUart.readStringUntil('\n');
+    String supplyV;
+    if (!extractJsonRawValue(voltResp, "\"value\":", supplyV))
+    {
+      supplyV = "null";
+    }
+
+    notecardUart.println("{\"req\":\"card.location\"}");
+    const String locResp = notecardUart.readStringUntil('\n');
+    String lat, lon;
+    const bool hasLoc = extractJsonRawValue(locResp, "\"lat\":", lat) &&
+                        extractJsonRawValue(locResp, "\"lon\":", lon);
+
+    port.print("{\"status\":\"ok\",\"version\":\"");
+    port.print(kFirmwareVersion);
+    port.print("\",\"category\":\"");
+    port.print(kDeviceCategoryId);
+    port.print("\",\"product_uid\":\"");
+    port.print(gProductUid);
+    port.print("\",\"serial_number\":\"");
+    port.print(gSerialNumber);
+    port.print("\",\"sample_period_ms\":");
+    port.print(gSamplePeriodMs);
+    port.print(",\"adc\":");
+    port.print(adc);
+    port.print(",\"adc_voltage_v\":");
+    port.print(adcVoltStr);
+    port.print(",\"supply_voltage_v\":");
+    port.print(supplyV);
+    port.print(",\"lat\":");
+    port.print(hasLoc ? lat : String("null"));
+    port.print(",\"lon\":");
+    port.print(hasLoc ? lon : String("null"));
+    port.println("}");
+  }
+
+  bool tryHandleGetStatusCommand(const String &line, Print &reply)
+  {
+    if (line.indexOf("\"cmd\":\"get_status\"") == -1)
+    {
+      return false;
+    }
+    sendStatusJsonTo(reply);
+    return true;
+  }
+
+  /** Parses `"key":"value"` — value must not contain escaped quotes. */
+  bool extractJsonStringValue(const String &line, const char *keyWithQuotes, String &out)
+  {
+    out = "";
+    const int p = line.indexOf(keyWithQuotes);
+    if (p < 0)
+    {
+      return false;
+    }
+    const int start = p + static_cast<int>(strlen(keyWithQuotes));
+    const int end = line.indexOf('"', start);
+    if (end <= start)
+    {
+      return false;
+    }
+    out = line.substring(start, end);
+    return true;
+  }
+
+  /** Parses `"key":123` (unquoted). Pass the key with trailing colon, e.g. `"period_ms":`. */
+  bool extractJsonNumberValue(const String &line, const char *keyWithColon, unsigned long &out)
+  {
+    int start = line.indexOf(keyWithColon);
+    if (start < 0)
+    {
+      return false;
+    }
+    start += static_cast<int>(strlen(keyWithColon));
+    while (start < line.length() && line[start] == ' ')
+    {
+      start++;
+    }
+    int end = start;
+    while (end < line.length() && isDigit(line[end]))
+    {
+      end++;
+    }
+    if (end == start)
+    {
+      return false;
+    }
+    out = strtoul(line.substring(start, end).c_str(), nullptr, 10);
+    return true;
+  }
+
+  /** Parses `"key":3.14` or `"key":-70.87`, keeping sign/decimal point as raw text. */
+  bool extractJsonRawValue(const String &line, const char *keyWithColon, String &out)
+  {
+    out = "";
+    int start = line.indexOf(keyWithColon);
+    if (start < 0)
+    {
+      return false;
+    }
+    start += static_cast<int>(strlen(keyWithColon));
+    while (start < static_cast<int>(line.length()) && line[start] == ' ')
+    {
+      start++;
+    }
+    int end = start;
+    if (end < static_cast<int>(line.length()) && line[end] == '-')
+    {
+      end++;
+    }
+    while (end < static_cast<int>(line.length()) && (isDigit(line[end]) || line[end] == '.'))
+    {
+      end++;
+    }
+    if (end == start)
+    {
+      return false;
+    }
+    out = line.substring(start, end);
+    return true;
+  }
+
+  void pushNotecardHubIdentityAndSync()
+  {
+    notecardUart.println((String("{\"req\":\"hub.set\",\"product\":\"") + gProductUid + "\",\"sn\":\"" + gSerialNumber + "\"}").c_str());
+    delay(1000);
+    notecardUart.println("{\"req\":\"hub.set\",\"mode\":\"continuous\",\"sync\":true}");
+    delay(2000);
+    dbgPrintln("Performing hub.sync after identity update...");
+    notecardUart.println("{\"req\":\"hub.sync\"}");
+    notecardUart.readStringUntil('\n');
+    delay(1500);
+  }
+
+  // Shared tail for a successful UID/serial update: reply, push identity to the
+  // Notecard, sync, then reset so the new identity takes effect from boot.
+  void finishIdentityUpdateAndReset(Print &reply, const char *dbgMsg)
+  {
+    reply.println(
+        "{\"status\":\"ok\",\"msg\":\"Identity saved. Syncing Notehub and restarting...\"}");
+    dbgPrintln(dbgMsg);
+    pushNotecardHubIdentityAndSync();
+    delay(500);
+    NVIC_SystemReset();
+  }
+
+  // Recognizes setup_device (lenient match) or set_config; pushes identity to
+  // the Notecard and resets the MCU. Ignored during setupPhaseReceiveDeviceConfig.
+  bool tryHandleRuntimeIdentityCommand(const String &line, Print &reply)
+  {
+    const bool cmdGetCfg = line.indexOf("\"cmd\":\"get_config\"") >= 0;
+    if (cmdGetCfg)
+    {
+      return false;
+    }
+
+    const bool wantsSetup =
+        line.indexOf("setup_device") >= 0 || line.indexOf("\"cmd\":\"setup_device\"") >= 0;
+    const bool wantsSetCfg = line.indexOf("\"cmd\":\"set_config\"") >= 0;
+    if (!wantsSetup && !wantsSetCfg)
+    {
+      return false;
+    }
+
+    String uid;
+    String sn;
+    const bool hasUid = extractJsonStringValue(line, "\"product_uid\":\"", uid);
+    const bool hasSn = extractJsonStringValue(line, "\"serial_number\":\"", sn);
+
+    if (wantsSetup)
+    {
+      if (!hasUid || !hasSn || uid.length() == 0 || sn.length() == 0)
+      {
+        reply.println("{\"status\":\"error\",\"msg\":\"setup_device requires product_uid and serial_number\"}");
+        return true;
+      }
+      if (uid.length() > kMaxProductUidLength || sn.length() > kMaxSerialNumLength)
+      {
+        reply.println("{\"status\":\"error\",\"msg\":\"UID or serial too long\"}");
+        return true;
+      }
+      saveProductUidToEeprom(uid.c_str());
+      saveSerialNumberToEeprom(sn.c_str());
+    }
+    else
+    {
+      // set_config allows a partial update (uid only, sn only, or both).
+      bool any = false;
+      if (hasUid && uid.length() > 0 && uid.length() <= kMaxProductUidLength)
+      {
+        saveProductUidToEeprom(uid.c_str());
+        any = true;
+      }
+      if (hasSn && sn.length() > 0 && sn.length() <= kMaxSerialNumLength)
+      {
+        saveSerialNumberToEeprom(sn.c_str());
+        any = true;
+      }
+      if (!any)
+      {
+        reply.println("{\"status\":\"error\",\"msg\":\"No valid product_uid or serial_number in set_config\"}");
+        return true;
+      }
+    }
+
+    finishIdentityUpdateAndReset(reply, ">> Runtime identity update: pushing hub.set + sync, then reset");
+    return true;
+  }
+
+  // {"cmd":"set_sample_period","period_ms":N} — applies immediately, not persisted to EEPROM.
+  bool tryHandleSetSamplePeriodCommand(const String &line, Print &reply)
+  {
+    if (line.indexOf("\"cmd\":\"set_sample_period\"") == -1)
+    {
+      return false;
+    }
+
+    unsigned long periodMs = 0;
+    if (!extractJsonNumberValue(line, "\"period_ms\":", periodMs) ||
+        periodMs < kMinSamplePeriodMs || periodMs > kMaxSamplePeriodMs)
+    {
+      char err[160];
+      snprintf(err, sizeof(err),
+               "{\"status\":\"error\",\"msg\":\"period_ms must be between %lu and %lu\"}",
+               kMinSamplePeriodMs, kMaxSamplePeriodMs);
+      reply.println(err);
+      return true;
+    }
+
+    gSamplePeriodMs = periodMs;
+    dbgPrint(">> Sample period updated to (ms): ");
+    dbgPrintln(gSamplePeriodMs);
+
+    char ok[96];
+    snprintf(ok, sizeof(ok),
+             "{\"status\":\"ok\",\"msg\":\"Sample period updated\",\"period_ms\":%lu}",
+             gSamplePeriodMs);
+    reply.println(ok);
+    return true;
+  }
+
+  // {"cmd":"echo","payload":...} or bare "echo <text>" — round-trip test for the BLE link.
+  bool tryHandleEchoCommand(const String &line, Print &reply)
+  {
+    const bool isJsonEcho = line.indexOf("\"cmd\":\"echo\"") >= 0;
+    const bool isBareEcho = line.startsWith("echo ");
+    if (!isJsonEcho && !isBareEcho)
+    {
+      return false;
+    }
+
+    if (isBareEcho)
+    {
+      String payload = line.substring(5);
+      reply.println(String("{\"status\":\"ok\",\"echo\":\"") + payload + "\"}");
+      return true;
+    }
+
+    String strPayload;
+    if (extractJsonStringValue(line, "\"payload\":\"", strPayload))
+    {
+      reply.println(String("{\"status\":\"ok\",\"echo\":\"") + strPayload + "\"}");
+      return true;
+    }
+
+    String rawPayload;
+    if (extractJsonRawValue(line, "\"payload\":", rawPayload))
+    {
+      reply.println(String("{\"status\":\"ok\",\"echo\":") + rawPayload + "}");
+      return true;
+    }
+
+    reply.println("{\"status\":\"ok\",\"msg\":\"echo received\"}");
+    return true;
+  }
+
+  // Retrofit config/echo commands use a flat `{"<name>":"<value>"}` style (values always
+  // quoted, even numbers) distinct from the `{"cmd":"..."}` commands above, matching the app.
+
+  // normal = continuous Notecard sync, sleep = on-demand ("minimum") sync.
+  void applyBleModeToNotecard()
+  {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "{\"req\":\"hub.set\",\"mode\":\"%s\"}", gBleSleepMode ? "minimum" : "continuous");
+    notecardUart.println(cmd);
+    notecardUart.readStringUntil('\n');
+  }
+
+  // Non-blocking: refreshes at most once per kEmaSamplePeriodMs.
+  void updateAdcFilter()
+  {
+    const unsigned long nowMs = millis();
+    if (gAdcFilterInitialized && (nowMs - lastEmaSampleMs < kEmaSamplePeriodMs))
+    {
+      return;
+    }
+    lastEmaSampleMs = nowMs;
+
+    gRawAdcValue = analogRead(kAdcPin);
+    if (!gAdcFilterInitialized)
+    {
+      gFilteredAdcValue = static_cast<float>(gRawAdcValue);
+      gAdcFilterInitialized = true;
+      return;
+    }
+    // Standard EMA: alpha = 2 / (N + 1), N = gEmaSampleN (configured smoothing level).
+    const float alpha = 2.0f / (static_cast<float>(gEmaSampleN) + 1.0f);
+    gFilteredAdcValue += alpha * (static_cast<float>(gRawAdcValue) - gFilteredAdcValue);
+  }
+
+  // Tolerates stray spaces in flat command keys, e.g. `{" set_ble_mode ":"sleep"}`.
+  String stripSpaces(const String &s)
+  {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++)
+    {
+      if (s[i] != ' ')
+      {
+        out += s[i];
+      }
+    }
+    return out;
+  }
+
+  bool flatKeyPresent(const String &compactLine, const String &key)
+  {
+    return compactLine.indexOf("\"" + key + "\":") >= 0;
+  }
+
+  bool extractFlatStringValue(const String &compactLine, const String &key, String &out)
+  {
+    return extractJsonStringValue(compactLine, ("\"" + key + "\":\"").c_str(), out);
+  }
+
+  bool extractFlatULongValue(const String &compactLine, const String &key, unsigned long &out)
+  {
+    String s;
+    if (!extractFlatStringValue(compactLine, key, s) || s.length() == 0)
+    {
+      return false;
+    }
+    out = strtoul(s.c_str(), nullptr, 10);
+    return true;
+  }
+
+  // Handles {"echo":"<field>"}; `field` has already been extracted from the command.
+  bool tryHandleRetrofitEcho(const String &field, Print &reply)
+  {
+    char buf[160];
+
+    if (field == "embedded_software_ver")
+    {
+      snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"embedded_software_ver\":\"%s\"}", kFirmwareVersion);
+      reply.println(buf);
+      return true;
+    }
+    if (field == "notecard_ver" || field == "uid")
+    {
+      // card.version's "version" is the Notecard firmware version;
+      // its "device" field is the Notehub-assigned DeviceUID.
+      notecardUart.println("{\"req\":\"card.version\"}");
+      const String resp = notecardUart.readStringUntil('\n');
+      String value;
+      const bool ok = (field == "notecard_ver")
+                          ? extractJsonStringValue(resp, "\"version\":\"", value)
+                          : extractJsonStringValue(resp, "\"device\":\"", value);
+      if (ok)
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"%s\":\"%s\"}", field.c_str(), value.c_str());
+      }
+      else
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"No response from Notecard\"}");
+      }
+      reply.println(buf);
+      return true;
+    }
+    if (field == "set_data_e_t_sec")
+    {
+      snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"set_data_e_t_sec\":%lu}", gDataIntervalSec);
+      reply.println(buf);
+      return true;
+    }
+    if (field == "set_sensor_init_t_sec")
+    {
+      snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"set_sensor_init_t_sec\":%u}", gSensorInitSec);
+      reply.println(buf);
+      return true;
+    }
+    if (field == "sample_rate")
+    {
+      snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"sample_rate\":%u}", gEmaSampleN);
+      reply.println(buf);
+      return true;
+    }
+    if (field == "ble_state")
+    {
+      snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"ble_state\":\"%s\"}", gBleSleepMode ? "sleep" : "normal");
+      reply.println(buf);
+      return true;
+    }
+    if (field == "sensor_adc_value")
+    {
+      updateAdcFilter();
+      // Manual 2-decimal formatting (values always >= 0) avoids relying on %f support.
+      char filteredStr[16];
+      const int filteredWhole = static_cast<int>(gFilteredAdcValue);
+      const int filteredFrac = static_cast<int>(gFilteredAdcValue * 100.0f) % 100;
+      snprintf(filteredStr, sizeof(filteredStr), "%d.%02d", filteredWhole, filteredFrac);
+      snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"raw\":%d,\"filtered\":%s}", gRawAdcValue, filteredStr);
+      reply.println(buf);
+      return true;
+    }
+    for (uint8_t i = 0; i < kPumpCount; i++)
+    {
+      char highKey[24];
+      char lowKey[24];
+      snprintf(highKey, sizeof(highKey), "pump_%u_high_thr", i + 1);
+      snprintf(lowKey, sizeof(lowKey), "pump_%u_low_thr", i + 1);
+      if (field == highKey)
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"%s\":%u}", highKey, gPumpHighThr[i]);
+        reply.println(buf);
+        return true;
+      }
+      if (field == lowKey)
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"%s\":%u}", lowKey, gPumpLowThr[i]);
+        reply.println(buf);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Handles flat retrofit config/echo commands, e.g. {"set_data_e_t_sec":"900"} or {"echo":"sample_rate"}.
+  bool tryHandleRetrofitCommand(const String &line, Print &reply)
+  {
+    const String compact = stripSpaces(line);
+
+    String echoField;
+    if (extractFlatStringValue(compact, "echo", echoField))
+    {
+      if (!tryHandleRetrofitEcho(echoField, reply))
+      {
+        reply.println("{\"status\":\"error\",\"msg\":\"Unknown echo field\"}");
+      }
+      return true;
+    }
+
+    unsigned long val;
+    char buf[128];
+
+    if (extractFlatULongValue(compact, "set_data_e_t_sec", val))
+    {
+      if (val < kMinDataIntervalSec || val > kMaxDataIntervalSec)
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"set_data_e_t_sec must be between %lu and %lu\"}",
+                 kMinDataIntervalSec, kMaxDataIntervalSec);
+      }
+      else
+      {
+        gDataIntervalSec = val;
+        gSamplePeriodMs = gDataIntervalSec * 1000UL;
+        EEPROM.put(kEepromDataIntervalSecAddr, gDataIntervalSec);
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"set_data_e_t_sec\":%lu}", gDataIntervalSec);
+      }
+      reply.println(buf);
+      return true;
+    }
+
+    if (extractFlatULongValue(compact, "set_sensor_init_t_sec", val))
+    {
+      if (val > kMaxSensorInitSec)
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"set_sensor_init_t_sec must be 0-%u\"}", kMaxSensorInitSec);
+      }
+      else
+      {
+        gSensorInitSec = static_cast<uint16_t>(val);
+        EEPROM.put(kEepromSensorInitSecAddr, gSensorInitSec);
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"set_sensor_init_t_sec\":%u}", gSensorInitSec);
+      }
+      reply.println(buf);
+      return true;
+    }
+
+    if (extractFlatULongValue(compact, "set_sample", val))
+    {
+      if (val < kMinEmaSampleN || val > kMaxEmaSampleN)
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"set_sample must be between %u and %u\"}",
+                 kMinEmaSampleN, kMaxEmaSampleN);
+      }
+      else
+      {
+        gEmaSampleN = static_cast<uint16_t>(val);
+        EEPROM.put(kEepromEmaSampleAddr, gEmaSampleN);
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"set_sample\":%u}", gEmaSampleN);
+      }
+      reply.println(buf);
+      return true;
+    }
+
+    String bleModeVal;
+    if (extractFlatStringValue(compact, "set_ble_mode", bleModeVal))
+    {
+      if (bleModeVal == "normal" || bleModeVal == "sleep")
+      {
+        gBleSleepMode = (bleModeVal == "sleep");
+        EEPROM.write(kEepromBleModeAddr, gBleSleepMode ? 1 : 0);
+        applyBleModeToNotecard();
+        snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"set_ble_mode\":\"%s\"}", bleModeVal.c_str());
+      }
+      else
+      {
+        snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"set_ble_mode must be normal or sleep\"}");
+      }
+      reply.println(buf);
+      return true;
+    }
+
+    if (flatKeyPresent(compact, "reset_ble"))
+    {
+      dbgPrintln(">> Received reset_ble command");
+      // AT+RESET is the only reset path (no hardware reset pin wired to the HM-10).
+      // It typically only takes effect while the module isn't actively BLE-connected,
+      // so this may not apply while the app's session is live.
+      bleUart.print("AT+RESET");
+      delay(500);
+      bleUart.end();
+      delay(100);
+      bleUart.begin(9600);
+      reply.println("{\"status\":\"ok\",\"msg\":\"BLE module reset\"}");
+      return true;
+    }
+
+    for (uint8_t i = 0; i < kPumpCount; i++)
+    {
+      char highKey[24];
+      char lowKey[24];
+      snprintf(highKey, sizeof(highKey), "pump_%u_set_high", i + 1);
+      snprintf(lowKey, sizeof(lowKey), "pump_%u_set_low", i + 1);
+
+      if (extractFlatULongValue(compact, highKey, val))
+      {
+        if (val > kAdcMaxValue)
+        {
+          snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"%s must be 0-%u\"}", highKey, kAdcMaxValue);
+        }
+        else
+        {
+          gPumpHighThr[i] = static_cast<uint16_t>(val);
+          savePumpThresholdToEeprom(i, true, gPumpHighThr[i]);
+          snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"%s\":%u}", highKey, gPumpHighThr[i]);
+        }
+        reply.println(buf);
+        return true;
+      }
+      if (extractFlatULongValue(compact, lowKey, val))
+      {
+        if (val > kAdcMaxValue)
+        {
+          snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"%s must be 0-%u\"}", lowKey, kAdcMaxValue);
+        }
+        else
+        {
+          gPumpLowThr[i] = static_cast<uint16_t>(val);
+          savePumpThresholdToEeprom(i, false, gPumpLowThr[i]);
+          snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"%s\":%u}", lowKey, gPumpLowThr[i]);
+        }
+        reply.println(buf);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Flat-style identity update, e.g. {"set_product_uid":"..."} and/or
+  // {"set_serial_number":"..."} (either or both in one message). Mirrors
+  // set_config: saves to EEPROM, pushes identity to the Notecard, then resets.
+  bool tryHandleFlatIdentityCommand(const String &line, Print &reply)
+  {
+    const String compact = stripSpaces(line);
+
+    String uid;
+    String sn;
+    const bool hasUid = extractFlatStringValue(compact, "set_product_uid", uid);
+    const bool hasSn = extractFlatStringValue(compact, "set_serial_number", sn);
+    if (!hasUid && !hasSn)
+    {
+      return false;
+    }
+
+    bool any = false;
+    if (hasUid && uid.length() > 0 && uid.length() <= kMaxProductUidLength)
+    {
+      saveProductUidToEeprom(uid.c_str());
+      any = true;
+    }
+    if (hasSn && sn.length() > 0 && sn.length() <= kMaxSerialNumLength)
+    {
+      saveSerialNumberToEeprom(sn.c_str());
+      any = true;
+    }
+    if (!any)
+    {
+      reply.println("{\"status\":\"error\",\"msg\":\"No valid set_product_uid or set_serial_number\"}");
+      return true;
+    }
+
+    finishIdentityUpdateAndReset(reply, ">> Flat identity update: pushing hub.set + sync, then reset");
+    return true;
+  }
+
+  // Blocks until product UID + serial are stored AND confirmed over BLE:
+  //   1. setup_device (product_uid + serial_number) -> stored to EEPROM
+  //   2. confirm_setup -> only then does this return
+  // get_config is answered during the wait so the app can read current values.
+  // No timeout: main loop / ADC don't start until this returns.
+  void setupPhaseReceiveDeviceConfig(bool uidAlreadyStored, bool snAlreadyStored)
+  {
+    bool uidReceived = uidAlreadyStored;
+    bool snReceived = snAlreadyStored;
+    bool confirmationReceived = false;
+
+    dbgPrintln();
+    dbgPrintln("========================================");
+    dbgPrintln("  SETUP PHASE: Device Configuration");
+    dbgPrintln("========================================");
+    dbgPrintln();
+    dbgPrintln("STEP 1: Send setup command from the PWA over BLE:");
+    dbgPrintln(R"({"cmd":"setup_device","product_uid":"YOUR_UID","serial_number":"YOUR_SN"})");
+    dbgPrintln();
+    dbgPrintln("STEP 2: After receiving values, send confirmation:");
+    dbgPrintln(R"({"cmd":"confirm_setup"})");
+    dbgPrintln();
+    dbgPrintln("Optional: Send {\"cmd\":\"get_config\"} to read current values.");
+    dbgPrintln();
+
+    while (!confirmationReceived)
+    {
+      if (bleUart.available())
+      {
+        String line = bleUart.readStringUntil('\n');
+        line.trim();
+        if (line.length() > 0)
+        {
+          dbgPrint(">> BLE: ");
+          dbgPrintln(line);
+
+          if (tryHandleGetConfigLine(line, bleUart))
+          {
+            // handled
+          }
+          else if (line.indexOf("\"cmd\":\"confirm_setup\"") != -1)
+          {
+            if (uidReceived && snReceived)
+            {
+              confirmationReceived = true;
+              bleUart.println("{\"status\":\"ok\",\"msg\":\"Setup confirmed. Device booting...\"}");
+              dbgPrintln("Setup confirmed by PWA!");
+            }
+            else
+            {
+              bleUart.println("{\"status\":\"error\",\"msg\":\"ProductUID and SerialNumber must be set first\"}");
+              dbgPrintln("Cannot confirm: missing ProductUID or SerialNumber");
+            }
+          }
+          else
+          {
+            String uid;
+            String sn;
+            if (!uidReceived && extractJsonStringValue(line, "\"product_uid\":\"", uid))
+            {
+              if (uid.length() > 0 && uid.length() <= kMaxProductUidLength)
+              {
+                saveProductUidToEeprom(uid.c_str());
+                uidReceived = true;
+                dbgPrintln("ProductUID received and stored");
+              }
+            }
+            if (!snReceived && extractJsonStringValue(line, "\"serial_number\":\"", sn))
+            {
+              if (sn.length() > 0 && sn.length() <= kMaxSerialNumLength)
+              {
+                saveSerialNumberToEeprom(sn.c_str());
+                snReceived = true;
+                dbgPrintln("SerialNumber received and stored");
+              }
+            }
+          }
+        }
+      }
+
+      delay(50);
+    }
+  }
+
+} // namespace
+
+// ===================================================================
+//  SETUP
+// ===================================================================
+void setup()
+{
+  Serial.begin(9600);       // debug log output only
+  notecardUart.begin(9600); // Serial1 via F_TX/F_RX
+  bleUart.begin(9600);      // HM-10 default baud; PWA control channel
+
+  notecardUart.setTimeout(5000);
+  bleUart.setTimeout(1000);
+
+  pinMode(kAdcPin, INPUT_ANALOG);
+  analogReadResolution(12);
+  pinMode(kNotecardAttnPin, INPUT);
+
+  delay(3000);
+
+  if (kClearEepromOnBoot)
+  {
+    dbgPrintln("WARNING: Clearing EEPROM (kClearEepromOnBoot = 1)");
+    clearAllConfigEeprom();
+  }
+
+  bool uidLoaded = loadProductUidFromEeprom();
+  bool snLoaded = loadSerialNumberFromEeprom();
+
+  if (!uidLoaded || !snLoaded)
+  {
+    setupPhaseReceiveDeviceConfig(uidLoaded, snLoaded);
+  }
+
+  loadRetrofitConfigFromEeprom();
+  gSamplePeriodMs = gDataIntervalSec * 1000UL;
+
+  notecardUart.println((String("{\"req\":\"hub.set\",\"product\":\"") + gProductUid + "\",\"sn\":\"" + gSerialNumber + "\"}").c_str());
+  delay(1000);
+  {
+    char modeCmd[80];
+    snprintf(modeCmd, sizeof(modeCmd), "{\"req\":\"hub.set\",\"mode\":\"%s\",\"sync\":true}",
+             gBleSleepMode ? "minimum" : "continuous");
+    notecardUart.println(modeCmd);
+  }
+  delay(2000);
+
+  // Sync immediately to register the device on the Notehub dashboard.
+  dbgPrintln("Performing initial hub.sync to register device...");
+  notecardUart.println("{\"req\":\"hub.sync\"}");
+  notecardUart.readStringUntil('\n');
+  delay(3000);
+
+  dbgPrint("Notecard configured - ProductUID: ");
+  dbgPrint(gProductUid);
+  dbgPrint(" | SerialNumber: ");
+  dbgPrintln(gSerialNumber);
+  delay(5000);
+
+  armNotecardAttn();
+
+  dbgPrintln("===Starting main loop===");
+  delay(3000);
+}
+
+// ===================================================================
+//  MAIN LOOP
+// ===================================================================
+void loop()
+{
+  const unsigned long nowMs = millis();
+
+  updateAdcFilter();
+
+  // 0) Inbound Notecard note (ATTN pin HIGH): sync, fetch + delete one note, re-arm.
+  if (digitalRead(kNotecardAttnPin) == HIGH)
+  {
+    dbgPrintln();
+    dbgPrintln("-- Notecard ATTN HIGH: polling inbound note --");
+
+    notecardUart.println("{\"req\":\"hub.sync\"}");
+    notecardUart.readStringUntil('\n'); // clear immediate {}
+    delay(5000);
+
+    while (notecardUart.available())
+    {
+      notecardUart.read();
+    }
+
+    char getNoteCmd[300];
+    snprintf(getNoteCmd, sizeof(getNoteCmd),
+             "{\"req\":\"note.get\",\"file\":\"%s\",\"delete\":true}",
+             kInboundNotefile);
+    notecardUart.println(getNoteCmd);
+
+    const String noteContent = notecardUart.readStringUntil('\n');
+    dbgPrint(">> Note Received: ");
+    dbgPrintln(noteContent);
+
+    dbgPrintln("Re-arming Notecard ATTN...");
+    armNotecardAttn();
+    delay(3000);
+  }
+
+  // 1) Inbound BLE commands from the PWA (sole control channel).
+  if (bleUart.available())
+  {
+    String line = bleUart.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0)
+    {
+      dbgPrint(">> BLE RX: ");
+      dbgPrintln(line);
+
+      if (tryHandleGetConfigLine(line, bleUart))
+      {
+        // handled
+      }
+      else if (tryHandleGetStatusCommand(line, bleUart))
+      {
+        // handled
+      }
+      else if (tryHandleRuntimeIdentityCommand(line, bleUart))
+      {
+        // handled (may reset MCU)
+      }
+      else if (tryHandleFlatIdentityCommand(line, bleUart))
+      {
+        // handled (may reset MCU)
+      }
+      else if (tryHandleSetSamplePeriodCommand(line, bleUart))
+      {
+        // handled
+      }
+      else if (tryHandleEchoCommand(line, bleUart))
+      {
+        // handled
+      }
+      else if (tryHandleRetrofitCommand(line, bleUart))
+      {
+        // handled
+      }
+      else if (line.indexOf("\"cmd\":\"reset_config\"") != -1)
+      {
+        dbgPrintln(">> Received reset_config command");
+        clearProductUidEeprom();
+        clearSerialNumberEeprom();
+        bleUart.println("{\"status\":\"ok\",\"msg\":\"Config cleared. Restarting for reconfiguration...\"}");
+        delay(1000);
+        NVIC_SystemReset();
+      }
+      else
+      {
+        dbgPrintln(">> Unrecognized command");
+      }
+    }
+  }
+
+  // 2) Periodic ADC sample -> BLE (to the PWA) + Notecard (cloud).
+  if (nowMs - lastSampleMs >= gSamplePeriodMs)
+  {
+    lastSampleMs = nowMs;
+
+    const int adc = analogRead(kAdcPin);
+    dbgPrint("Raw ADC: ");
+    dbgPrintln(adc);
+
+    bleUart.print("ADC value:");
+    bleUart.print(adc);
+    bleUart.print("\r\n");
+
+    char addNoteCmd[220];
+    snprintf(addNoteCmd, sizeof(addNoteCmd),
+             "{\"req\":\"note.add\",\"file\":\"%s\",\"sync\":true,\"body\":{\"adc\":%d}}",
+             kOutboundNotefile, adc);
+    notecardUart.println(addNoteCmd);
+    const String addResp = notecardUart.readStringUntil('\n');
+    if (addResp.indexOf("\"err\"") >= 0)
+    {
+      dbgPrint("Warning: Note add response: ");
+      dbgPrintln(addResp);
+    }
+  }
+}
