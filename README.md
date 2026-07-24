@@ -124,9 +124,9 @@ Notes:
 - Pump state is **not persisted** — all 6 pumps reset to OFF on every boot.
 - This is a **logical state only**: no GPIO/relay pin is driven. Physical
   pump control is not wired up yet.
-- There's no on-demand read-back for "is pump N currently on" — a PWA that
-  (re)connects mid-session won't know current states until the next
-  transition.
+- A PWA that (re)connects mid-session can read current states on demand via
+  `{"cmd":"get_pump_states"}` (see [Commands](#commands)) instead of waiting
+  for the next transition.
 - Thresholds are validated independently (0–100 each); nothing enforces
   `high > low` per pump in firmware, so a misconfigured pair could oscillate.
 
@@ -157,6 +157,7 @@ All commands are sent over BLE as single JSON lines. The firmware recognizes
 |---|---|---|
 | Get config | `{"cmd":"get_config"}` | `{status, category, product_uid, serial_number, sample_period_ms}` |
 | Get status | `{"cmd":"get_status"}` | Full status: version, category, product_uid, serial_number, sample_period_ms, adc, adc_voltage_v, supply_voltage_v (from Notecard `card.voltage`), lat/lon (from `card.location`) |
+| Get pump states | `{"cmd":"get_pump_states"}` | On-demand read-back: `{status, pump_1_state...pump_6_state ("on"/"off"), current_water_level}` — for a PWA that just (re)connected, instead of waiting for the next hysteresis transition |
 | Setup device | `{"cmd":"setup_device","product_uid":"...","serial_number":"..."}` | **First-boot only.** Stores both fields; must be followed by `confirm_setup` |
 | Confirm setup | `{"cmd":"confirm_setup"}` | **First-boot only.** Unblocks setup phase once UID+SN are stored |
 | Set config | `{"cmd":"set_config","product_uid":"...","serial_number":"..."}` | Runtime identity change (partial update ok); saves to EEPROM, pushes identity to Notecard, **resets MCU** |

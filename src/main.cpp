@@ -465,6 +465,8 @@ namespace
     return true;
   }
 
+  bool tryHandleGetPumpStatesCommand(const String &line, Print &reply);
+
   /** Parses `"key":"value"` — value must not contain escaped quotes. */
   bool extractJsonStringValue(const String &line, const char *keyWithQuotes, String &out)
   {
@@ -789,6 +791,31 @@ namespace
         dbgPrintln(msg);
       }
     }
+  }
+
+  // On-demand read-back of all 6 pumps' current ON/OFF state, for a PWA that
+  // just (re)connected and would otherwise have to wait for the next
+  // hysteresis transition -- see README.md "Pump ON/OFF control".
+  bool tryHandleGetPumpStatesCommand(const String &line, Print &reply)
+  {
+    if (line.indexOf("\"cmd\":\"get_pump_states\"") == -1)
+    {
+      return false;
+    }
+
+    reply.print("{\"status\":\"ok\"");
+    for (uint8_t i = 0; i < kPumpCount; i++)
+    {
+      reply.print(",\"pump_");
+      reply.print(i + 1);
+      reply.print("_state\":\"");
+      reply.print(gPumpState[i] ? "on" : "off");
+      reply.print("\"");
+    }
+    reply.print(",\"current_water_level\":");
+    reply.print(computeCurrentWaterLevelPercent());
+    reply.println("}");
+    return true;
   }
 
   // Tolerates stray spaces in flat command keys, e.g. `{" set_ble_mode ":"sleep"}`.
@@ -1309,6 +1336,10 @@ void loop()
         // handled
       }
       else if (tryHandleGetStatusCommand(line, bleUart))
+      {
+        // handled
+      }
+      else if (tryHandleGetPumpStatesCommand(line, bleUart))
       {
         // handled
       }
