@@ -759,6 +759,18 @@ namespace
     return static_cast<uint8_t>(gPumpLowThr[pumpIdx] / 2);
   }
 
+  // Pushes a pump's new ON/OFF state to the PWA over BLE and logs it. Caller
+  // has already updated gPumpState[pumpIdx].
+  void sendPumpStateChange(uint8_t pumpIdx, uint8_t pct, Print &blePort)
+  {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "{\"pump_%u_state\":\"%s\",\"current_water_level\":%u}",
+             pumpIdx + 1, gPumpState[pumpIdx] ? "on" : "off", pct);
+    blePort.println(msg);
+    dbgPrint(">> Pump state changed: ");
+    dbgPrintln(msg);
+  }
+
   // Hysteresis: ON above the high threshold, OFF below the low threshold.
   // Edge-triggered -- a BLE push only fires on an actual state change.
   void updatePumpControl(Print &blePort)
@@ -783,12 +795,7 @@ namespace
 
       if (changed)
       {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "{\"pump_%u_state\":\"%s\",\"current_water_level\":%u}",
-                 i + 1, gPumpState[i] ? "on" : "off", pct);
-        blePort.println(msg);
-        dbgPrint(">> Pump state changed: ");
-        dbgPrintln(msg);
+        sendPumpStateChange(i, pct, blePort);
       }
     }
   }
@@ -1063,6 +1070,20 @@ namespace
           gPumpHighThr[i] = static_cast<uint16_t>(val);
           savePumpThresholdToEeprom(i, true, gPumpHighThr[i]);
           snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"%s\":%u}", highKey, gPumpHighThr[i]);
+
+          // Operator "stop now": if the new start (high) level is now above the
+          // current water level, a running pump shouldn't be running yet -- stop
+          // it. This is deliberately edge-triggered on the command, not folded
+          // into updatePumpControl(): a continuous "OFF while below high" rule
+          // would erase the deadband between high/low and make the pump chatter.
+          // Once stopped this way it restarts normally, only when the level next
+          // climbs above this new (higher) start level.
+          const uint8_t pct = computeCurrentWaterLevelPercent();
+          if (gPumpState[i] && pct < effectivePumpHighThreshold(i))
+          {
+            gPumpState[i] = false;
+            sendPumpStateChange(i, pct, reply);
+          }
         }
         reply.println(buf);
         return true;

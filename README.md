@@ -108,6 +108,17 @@ Hysteresis then runs against these real values:
 - It stays ON until `current_water_level` drops **below** `real_low`, at
   which point it turns **OFF**.
 
+**Manual stop via the High setting.** Because normal hysteresis only consults
+`real_low` while a pump is running, raising `pump_N_set_high` alone would
+otherwise have no effect on an already-ON pump. As an operator override, when a
+`pump_N_set_high` command arrives and the new `real_high` is now **above** the
+current water level, a running pump is stopped immediately (an OFF push is
+emitted). This is edge-triggered on the command only — it is intentionally not
+part of the per-loop hysteresis check, since a continuous "OFF while below
+high" rule would erase the deadband and cause on/off chatter. After such a
+stop, the pump restarts normally, only once the level climbs above the new
+(higher) `real_high`.
+
 `pump_N_set_high`/`pump_N_set_low` and the `pump_N_high_thr`/`pump_N_low_thr`
 echo fields all read/write the *raw* 0–100 setting (matching what the PWA's
 slider shows) — the real trigger values are internal to the hysteresis logic
