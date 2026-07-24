@@ -55,7 +55,7 @@ namespace
   constexpr const char *kDeviceCategoryId = "dewater-pump-float";
 
   // Set true to wipe EEPROM on every boot (testing/reflashing only).
-  constexpr bool kClearEepromOnBoot = 1;
+  constexpr bool kClearEepromOnBoot = 0;
 
   constexpr uint16_t kEepromFlagAddr = 0;
   constexpr uint16_t kEepromProductUidAddr = 1;
