@@ -1,32 +1,16 @@
 #include <Arduino.h>
 #include <EEPROM.h>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 
-/*
-  Dewater Pump Float Replacement firmware.
-
-  Control channel: PWA <-> device is entirely over BLE (HM-10, `bleUart`).
-  USB `Serial` is debug-log output only, never a command channel.
-
-  Wiring:
-    notecardUart (Serial1): F_TX->N_RX, F_RX->N_TX, F_D5->N_ATTN
-    bleUart (HM-10):        A0<-TXD, A3->RXD, 3V3->VCC, GND->GND
-    (don't wire a USB-serial adapter to A0/A3 while the HM-10 is connected — same pins)
-
-  Notefiles: *.qi = inbound (note.get), *.qo = outbound (note.add).
-
-  First boot: PWA sends setup_device (product_uid + serial_number) then
-  confirm_setup over BLE — see setupPhaseReceiveDeviceConfig(). Later identity
-  changes use set_config at runtime — see tryHandleRuntimeIdentityCommand().
-*/
+// See README.md for architecture, wiring, boot flow, and the full BLE command reference.
 
 namespace
 {
 
   constexpr const char *kFirmwareVersion = "1.0.0";
 
-  // Debug logging over USB Serial, gated by kDebugLogEnabled.
   constexpr bool kDebugLogEnabled = true;
 
   template <typename T>
@@ -58,36 +42,21 @@ namespace
   HardwareSerial &notecardUart = Serial1;
   constexpr uint8_t kNotecardAttnPin = D5;
 
-  // Sole control channel for the PWA.
   constexpr uint8_t kBleUartRxPin = A0;
   constexpr uint8_t kBleUartTxPin = A3;
   HardwareSerial bleUart(kBleUartRxPin, kBleUartTxPin);
 
   constexpr uint8_t kAdcPin = PA1; // water level sensor
 
-  // Product UID/serial come from the PWA (setup_device) or EEPROM.
-  constexpr const char *kInboundNotefile = "data.qi";   // note.get
+  constexpr const char *kInboundNotefile = "data.qi";       // note.get
   constexpr const char *kOutboundNotefile = "retrofit.qo"; // note.add
 
-  // Must match this device's id in the app's categories.ts. HM-10 clones don't
-  // reliably support AT+NAME (advertised name stays "HMSoft"), so the app
-  // confirms category via get_config/get_status instead of the BLE name.
+  // Must match this device's id in the app's categories.ts.
   constexpr const char *kDeviceCategoryId = "dewater-pump-float";
 
   // Set true to wipe EEPROM on every boot (testing/reflashing only).
   constexpr bool kClearEepromOnBoot = 1;
 
-  // EEPROM layout:
-  //   [0:0]       0xAA if product UID configured, else 0x00
-  //   [1:128]     Product UID string (null-terminated, max 127 chars)
-  //   [129:129]   0xBB if serial number configured, else 0x00
-  //   [130:257]   Serial Number string (null-terminated, max 127 chars)
-  //   [258:258]   0xCC if retrofit config (below) is configured, else 0x00
-  //   [259:262]   Data send interval, seconds (unsigned long)
-  //   [263:264]   Sensor warm-up time, seconds (uint16_t)
-  //   [265:266]   EMA filter smoothing level (uint16_t)
-  //   [267:267]   BLE/Notecard sync mode: 0 = normal (continuous), 1 = sleep (on-demand)
-  //   [268:291]   6 pumps * (high threshold, low threshold) * 2 bytes (uint16_t each)
   constexpr uint16_t kEepromFlagAddr = 0;
   constexpr uint16_t kEepromProductUidAddr = 1;
   constexpr uint16_t kMaxProductUidLength = 127;
@@ -129,6 +98,9 @@ namespace
   constexpr uint16_t kMinEmaSampleN = 1;
   constexpr uint16_t kMaxEmaSampleN = 5000;
   constexpr uint16_t kAdcMaxValue = 4095;
+  // Raw 0-100 pump setting as received over BLE; see effectivePumpHighThreshold()/
+  // effectivePumpLowThreshold() for how this maps to the real trigger point.
+  constexpr uint16_t kPumpThresholdMaxPercent = 100;
 
   unsigned long gDataIntervalSec = kDefaultDataIntervalSec;
   uint16_t gSensorInitSec = kDefaultSensorInitSec;
@@ -136,6 +108,10 @@ namespace
   bool gBleSleepMode = false; // false = normal (continuous sync), true = sleep (on-demand)
   uint16_t gPumpHighThr[kPumpCount] = {0};
   uint16_t gPumpLowThr[kPumpCount] = {0};
+
+  // Computed by updatePumpControl(); not persisted (resets to OFF on boot).
+  // No GPIO/relay is driven -- reported to the PWA over BLE only.
+  bool gPumpState[kPumpCount] = {false};
 
   // Refreshed continuously by updateAdcFilter(), independent of gSamplePeriodMs
   // (which only controls how often a sample is reported/sent).
@@ -301,6 +277,66 @@ namespace
     dbgPrintln("Cleared ALL config from EEPROM");
   }
 
+  // AT+NAME limit per the HM-10 datasheet (1-12 bytes).
+  constexpr uint8_t kBleNameMaxLen = 12;
+
+  // Builds a short per-device name from category + serial, e.g. "dewater-pump-float"
+  // + "0001234567" -> "DPF-01234567" (serial truncated to its trailing chars if needed).
+  void buildBleAdvertisedName(char *out, size_t outSize)
+  {
+    char prefix[4] = {0};
+    uint8_t prefixLen = 0;
+    bool atSegmentStart = true;
+    for (const char *p = kDeviceCategoryId; *p != '\0' && prefixLen < 3; p++)
+    {
+      if (*p == '-')
+      {
+        atSegmentStart = true;
+        continue;
+      }
+      if (atSegmentStart)
+      {
+        prefix[prefixLen++] = static_cast<char>(toupper(*p));
+        atSegmentStart = false;
+      }
+    }
+    prefix[prefixLen] = '\0';
+
+    const size_t serialLen = strlen(gSerialNumber);
+    const size_t maxSerialChars = outSize - 1 /* dash */ - prefixLen - 1 /* null */;
+    const char *serialStart = (serialLen > maxSerialChars)
+                                   ? (gSerialNumber + serialLen - maxSerialChars)
+                                   : gSerialNumber;
+
+    snprintf(out, outSize, "%s-%s", prefix, serialStart);
+  }
+
+  // Best-effort: no-op if the serial number isn't known yet. Must run before
+  // any BLE central connects -- see README.md for why.
+  void applyBleAdvertisedName()
+  {
+    if (gSerialNumber[0] == '\0')
+    {
+      return;
+    }
+
+    char name[kBleNameMaxLen + 1];
+    buildBleAdvertisedName(name, sizeof(name));
+
+    dbgPrint(">> Setting BLE advertised name to: ");
+    dbgPrintln(name);
+
+    bleUart.print("AT+NAME");
+    bleUart.print(name);
+    delay(200);
+    dbgPrint(">> AT+NAME response: ");
+    while (bleUart.available())
+    {
+      dbgPrint(static_cast<char>(bleUart.read()));
+    }
+    dbgPrintln();
+  }
+
   void savePumpThresholdToEeprom(uint8_t pumpIdx, bool isHigh, uint16_t value)
   {
     const uint16_t addr = kEepromPumpThresholdsAddr + (pumpIdx * 4) + (isHigh ? 0 : 2);
@@ -357,9 +393,8 @@ namespace
     port.println("}");
   }
 
-  // All tryHandle*Command(s) below follow the same contract: return true (and
-  // reply on `reply`) if `line` matched and was handled, else return false so
-  // the next handler in the chain (see loop()) can try.
+  // tryHandle*Command functions share a contract: return true (and reply on
+  // `reply`) if `line` matched, else false so the next handler can try.
 
   bool tryHandleGetConfigLine(const String &line, Print &replyPort)
   {
@@ -660,8 +695,8 @@ namespace
     return true;
   }
 
-  // Retrofit config/echo commands use a flat `{"<name>":"<value>"}` style (values always
-  // quoted, even numbers) distinct from the `{"cmd":"..."}` commands above, matching the app.
+  // Below: flat `{"<name>":"<value>"}` retrofit commands (values always quoted),
+  // distinct from the `{"cmd":"..."}` commands above.
 
   // normal = continuous Notecard sync, sleep = on-demand ("minimum") sync.
   void applyBleModeToNotecard()
@@ -692,6 +727,68 @@ namespace
     // Standard EMA: alpha = 2 / (N + 1), N = gEmaSampleN (configured smoothing level).
     const float alpha = 2.0f / (static_cast<float>(gEmaSampleN) + 1.0f);
     gFilteredAdcValue += alpha * (static_cast<float>(gRawAdcValue) - gFilteredAdcValue);
+  }
+
+  // Uses the EMA-filtered reading, not raw ADC, to avoid relay chatter from sensor noise.
+  uint8_t computeCurrentWaterLevelPercent()
+  {
+    float v = gFilteredAdcValue;
+    if (v < 0.0f)
+    {
+      v = 0.0f;
+    }
+    else if (v > static_cast<float>(kAdcMaxValue))
+    {
+      v = static_cast<float>(kAdcMaxValue);
+    }
+    return static_cast<uint8_t>((v * 100.0f / static_cast<float>(kAdcMaxValue)) + 0.5f);
+  }
+
+  // Maps the raw 0-100 setting to its real current_water_level trigger point
+  // (High -> upper half 50-100%, Low -> lower half 0-50%) -- see README.md
+  // "Pump ON/OFF control" for why.
+  uint8_t effectivePumpHighThreshold(uint8_t pumpIdx)
+  {
+    return static_cast<uint8_t>(50 + gPumpHighThr[pumpIdx] / 2);
+  }
+
+  uint8_t effectivePumpLowThreshold(uint8_t pumpIdx)
+  {
+    return static_cast<uint8_t>(gPumpLowThr[pumpIdx] / 2);
+  }
+
+  // Hysteresis: ON above the high threshold, OFF below the low threshold.
+  // Edge-triggered -- a BLE push only fires on an actual state change.
+  void updatePumpControl(Print &blePort)
+  {
+    const uint8_t pct = computeCurrentWaterLevelPercent();
+    for (uint8_t i = 0; i < kPumpCount; i++)
+    {
+      const uint8_t realHigh = effectivePumpHighThreshold(i);
+      const uint8_t realLow = effectivePumpLowThreshold(i);
+
+      bool changed = false;
+      if (!gPumpState[i] && pct > realHigh)
+      {
+        gPumpState[i] = true;
+        changed = true;
+      }
+      else if (gPumpState[i] && pct < realLow)
+      {
+        gPumpState[i] = false;
+        changed = true;
+      }
+
+      if (changed)
+      {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "{\"pump_%u_state\":\"%s\",\"current_water_level\":%u}",
+                 i + 1, gPumpState[i] ? "on" : "off", pct);
+        blePort.println(msg);
+        dbgPrint(">> Pump state changed: ");
+        dbgPrintln(msg);
+      }
+    }
   }
 
   // Tolerates stray spaces in flat command keys, e.g. `{" set_ble_mode ":"sleep"}`.
@@ -911,9 +1008,7 @@ namespace
     if (flatKeyPresent(compact, "reset_ble"))
     {
       dbgPrintln(">> Received reset_ble command");
-      // AT+RESET is the only reset path (no hardware reset pin wired to the HM-10).
-      // It typically only takes effect while the module isn't actively BLE-connected,
-      // so this may not apply while the app's session is live.
+      // No hardware reset pin wired to the HM-10; AT+RESET may not apply while a BLE session is live.
       bleUart.print("AT+RESET");
       delay(500);
       bleUart.end();
@@ -932,9 +1027,9 @@ namespace
 
       if (extractFlatULongValue(compact, highKey, val))
       {
-        if (val > kAdcMaxValue)
+        if (val > kPumpThresholdMaxPercent)
         {
-          snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"%s must be 0-%u\"}", highKey, kAdcMaxValue);
+          snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"%s must be 0-%u\"}", highKey, kPumpThresholdMaxPercent);
         }
         else
         {
@@ -947,9 +1042,9 @@ namespace
       }
       if (extractFlatULongValue(compact, lowKey, val))
       {
-        if (val > kAdcMaxValue)
+        if (val > kPumpThresholdMaxPercent)
         {
-          snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"%s must be 0-%u\"}", lowKey, kAdcMaxValue);
+          snprintf(buf, sizeof(buf), "{\"status\":\"error\",\"msg\":\"%s must be 0-%u\"}", lowKey, kPumpThresholdMaxPercent);
         }
         else
         {
@@ -965,9 +1060,8 @@ namespace
     return false;
   }
 
-  // Flat-style identity update, e.g. {"set_product_uid":"..."} and/or
-  // {"set_serial_number":"..."} (either or both in one message). Mirrors
-  // set_config: saves to EEPROM, pushes identity to the Notecard, then resets.
+  // Flat identity update: {"set_product_uid":"..."} and/or {"set_serial_number":"..."}.
+  // Mirrors set_config -- saves to EEPROM, pushes identity to the Notecard, then resets.
   bool tryHandleFlatIdentityCommand(const String &line, Print &reply)
   {
     const String compact = stripSpaces(line);
@@ -1002,11 +1096,9 @@ namespace
     return true;
   }
 
-  // Blocks until product UID + serial are stored AND confirmed over BLE:
-  //   1. setup_device (product_uid + serial_number) -> stored to EEPROM
-  //   2. confirm_setup -> only then does this return
-  // get_config is answered during the wait so the app can read current values.
-  // No timeout: main loop / ADC don't start until this returns.
+  // Blocks until product UID + serial are stored and confirmed over BLE
+  // (setup_device then confirm_setup). No timeout -- main loop / ADC don't
+  // start until this returns.
   void setupPhaseReceiveDeviceConfig(bool uidAlreadyStored, bool snAlreadyStored)
   {
     bool uidReceived = uidAlreadyStored;
@@ -1093,9 +1185,9 @@ namespace
 // ===================================================================
 void setup()
 {
-  Serial.begin(9600);       // debug log output only
-  notecardUart.begin(9600); // Serial1 via F_TX/F_RX
-  bleUart.begin(9600);      // HM-10 default baud; PWA control channel
+  Serial.begin(9600);       // debug output only, not a command channel
+  notecardUart.begin(9600);
+  bleUart.begin(9600);      // HM-10 default baud
 
   notecardUart.setTimeout(5000);
   bleUart.setTimeout(1000);
@@ -1115,9 +1207,19 @@ void setup()
   bool uidLoaded = loadProductUidFromEeprom();
   bool snLoaded = loadSerialNumberFromEeprom();
 
+  if (uidLoaded && snLoaded)
+  {
+    // Already-configured device rebooting: apply the name now, before the PWA
+    // (or anything else) has a chance to connect.
+    applyBleAdvertisedName();
+  }
+
   if (!uidLoaded || !snLoaded)
   {
     setupPhaseReceiveDeviceConfig(uidLoaded, snLoaded);
+    // The PWA's setup session may still be connected here, so this can be a
+    // no-op -- it will reliably apply on the device's next boot regardless.
+    applyBleAdvertisedName();
   }
 
   loadRetrofitConfigFromEeprom();
@@ -1158,9 +1260,11 @@ void loop()
 {
   const unsigned long nowMs = millis();
 
+  // 0) Refresh ADC filter + pump hysteresis; pushes a BLE update on any state change.
   updateAdcFilter();
+  updatePumpControl(bleUart);
 
-  // 0) Inbound Notecard note (ATTN pin HIGH): sync, fetch + delete one note, re-arm.
+  // 1) Inbound Notecard note (ATTN pin HIGH): sync, fetch + delete one note, re-arm.
   if (digitalRead(kNotecardAttnPin) == HIGH)
   {
     dbgPrintln();
@@ -1190,7 +1294,7 @@ void loop()
     delay(3000);
   }
 
-  // 1) Inbound BLE commands from the PWA (sole control channel).
+  // 2) Inbound BLE commands from the PWA.
   if (bleUart.available())
   {
     String line = bleUart.readStringUntil('\n');
@@ -1244,23 +1348,23 @@ void loop()
     }
   }
 
-  // 2) Periodic ADC sample -> BLE (to the PWA) + Notecard (cloud).
+  // 3) Periodic water-level report -> BLE (to the PWA) + Notecard (cloud).
   if (nowMs - lastSampleMs >= gSamplePeriodMs)
   {
     lastSampleMs = nowMs;
 
-    const int adc = analogRead(kAdcPin);
-    dbgPrint("Raw ADC: ");
-    dbgPrintln(adc);
+    const uint8_t waterLevelPct = computeCurrentWaterLevelPercent();
+    dbgPrint("Current water level (%): ");
+    dbgPrintln(waterLevelPct);
 
-    bleUart.print("ADC value:");
-    bleUart.print(adc);
-    bleUart.print("\r\n");
+    char levelMsg[48];
+    snprintf(levelMsg, sizeof(levelMsg), "{\"current_water_level\":%u}", waterLevelPct);
+    bleUart.println(levelMsg);
 
     char addNoteCmd[220];
     snprintf(addNoteCmd, sizeof(addNoteCmd),
-             "{\"req\":\"note.add\",\"file\":\"%s\",\"sync\":true,\"body\":{\"adc\":%d}}",
-             kOutboundNotefile, adc);
+             "{\"req\":\"note.add\",\"file\":\"%s\",\"sync\":true,\"body\":{\"current_water_level\":%u}}",
+             kOutboundNotefile, waterLevelPct);
     notecardUart.println(addNoteCmd);
     const String addResp = notecardUart.readStringUntil('\n');
     if (addResp.indexOf("\"err\"") >= 0)
