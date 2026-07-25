@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 // See README.md for architecture, wiring, boot flow, and the full BLE command reference.
 
@@ -112,6 +113,10 @@ namespace
   // Computed by updatePumpControl(); not persisted (resets to OFF on boot).
   // No GPIO/relay is driven -- reported to the PWA over BLE only.
   bool gPumpState[kPumpCount] = {false};
+
+  // UTC epoch of each pump's most recent ON/OFF transition, for get_pump_states
+  // read-back. 0 = no transition since boot (or time unknown at that moment).
+  unsigned long gPumpLastChangeEpoch[kPumpCount] = {0};
 
   // Refreshed continuously by updateAdcFilter(), independent of gSamplePeriodMs
   // (which only controls how often a sample is reported/sent).
@@ -759,16 +764,74 @@ namespace
     return static_cast<uint8_t>(gPumpLowThr[pumpIdx] / 2);
   }
 
-  // Pushes a pump's new ON/OFF state to the PWA over BLE and logs it. Caller
-  // has already updated gPumpState[pumpIdx].
-  void sendPumpStateChange(uint8_t pumpIdx, uint8_t pct, Print &blePort)
+  // Queries the Notecard's real-time clock (set from cell tower / GPS on the
+  // first successful sync). Returns UTC seconds since the Unix epoch, or 0 if
+  // the Notecard has not yet obtained the time -- before that its response is
+  // {"err":"time is not yet set ..."} with no "time" field.
+  unsigned long fetchNotecardEpochTime()
   {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "{\"pump_%u_state\":\"%s\",\"current_water_level\":%u}",
-             pumpIdx + 1, gPumpState[pumpIdx] ? "on" : "off", pct);
+    notecardUart.println("{\"req\":\"card.time\"}");
+    const String resp = notecardUart.readStringUntil('\n');
+    unsigned long epoch = 0;
+    if (!extractJsonNumberValue(resp, "\"time\":", epoch))
+    {
+      return 0;
+    }
+    return epoch;
+  }
+
+  // Writes epoch as a JSON numeric token, or "null" when it is 0 (unknown).
+  void epochToJsonToken(unsigned long epoch, char *out, size_t outSize)
+  {
+    if (epoch != 0)
+    {
+      snprintf(out, outSize, "%lu", epoch);
+    }
+    else
+    {
+      strncpy(out, "null", outSize);
+      out[outSize - 1] = '\0';
+    }
+  }
+
+  // Appends " (UTC YYYY-MM-DD HH:MM:SS)" to the serial log for a non-zero epoch;
+  // a no-op when the Notecard has no time yet, so the log line just omits it.
+  void dbgPrintUtcSuffix(unsigned long epoch)
+  {
+    if (epoch == 0)
+    {
+      return;
+    }
+    const time_t t = static_cast<time_t>(epoch);
+    struct tm tmUtc;
+    gmtime_r(&t, &tmUtc);
+    char human[24];
+    strftime(human, sizeof(human), "%Y-%m-%d %H:%M:%S", &tmUtc);
+    dbgPrint(" (UTC ");
+    dbgPrint(human);
+    dbgPrint(")");
+  }
+
+  // Pushes a pump's new ON/OFF state to the PWA over BLE and logs it. Caller
+  // has already updated gPumpState[pumpIdx] and fetched the UTC epoch once for
+  // the cycle (0 = time not yet available from the Notecard, emitted as null).
+  void sendPumpStateChange(uint8_t pumpIdx, uint8_t pct, unsigned long epoch, Print &blePort)
+  {
+    gPumpLastChangeEpoch[pumpIdx] = epoch;
+
+    char timeTok[16];
+    epochToJsonToken(epoch, timeTok, sizeof(timeTok));
+
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "{\"pump_%u_state\":\"%s\",\"current_water_level\":%u,\"time\":%s}",
+             pumpIdx + 1, gPumpState[pumpIdx] ? "on" : "off", pct, timeTok);
     blePort.println(msg);
+
     dbgPrint(">> Pump state changed: ");
-    dbgPrintln(msg);
+    dbgPrint(msg);
+    dbgPrintUtcSuffix(epoch);
+    dbgPrintln();
   }
 
   // Hysteresis: ON above the high threshold, OFF below the low threshold.
@@ -776,6 +839,10 @@ namespace
   void updatePumpControl(Print &blePort)
   {
     const uint8_t pct = computeCurrentWaterLevelPercent();
+    // Fetched lazily on the first change this cycle so an idle sample costs no
+    // Notecard round-trip; reused for every pump that flips at the same level.
+    unsigned long epoch = 0;
+    bool epochFetched = false;
     for (uint8_t i = 0; i < kPumpCount; i++)
     {
       const uint8_t realHigh = effectivePumpHighThreshold(i);
@@ -795,7 +862,12 @@ namespace
 
       if (changed)
       {
-        sendPumpStateChange(i, pct, blePort);
+        if (!epochFetched)
+        {
+          epoch = fetchNotecardEpochTime();
+          epochFetched = true;
+        }
+        sendPumpStateChange(i, pct, epoch, blePort);
       }
     }
   }
@@ -818,6 +890,14 @@ namespace
       reply.print("_state\":\"");
       reply.print(gPumpState[i] ? "on" : "off");
       reply.print("\"");
+
+      // UTC epoch of this pump's last transition (null = none since boot).
+      char sinceTok[16];
+      epochToJsonToken(gPumpLastChangeEpoch[i], sinceTok, sizeof(sinceTok));
+      reply.print(",\"pump_");
+      reply.print(i + 1);
+      reply.print("_since\":");
+      reply.print(sinceTok);
     }
     reply.print(",\"current_water_level\":");
     reply.print(computeCurrentWaterLevelPercent());
@@ -1082,7 +1162,7 @@ namespace
           if (gPumpState[i] && pct < effectivePumpHighThreshold(i))
           {
             gPumpState[i] = false;
-            sendPumpStateChange(i, pct, reply);
+            sendPumpStateChange(i, pct, fetchNotecardEpochTime(), reply);
           }
         }
         reply.println(buf);
@@ -1406,11 +1486,18 @@ void loop()
     lastSampleMs = nowMs;
 
     const uint8_t waterLevelPct = computeCurrentWaterLevelPercent();
-    dbgPrint("Current water level (%): ");
-    dbgPrintln(waterLevelPct);
+    const unsigned long epoch = fetchNotecardEpochTime();
 
-    char levelMsg[48];
-    snprintf(levelMsg, sizeof(levelMsg), "{\"current_water_level\":%u}", waterLevelPct);
+    dbgPrint("Current water level (%): ");
+    dbgPrint(waterLevelPct);
+    dbgPrintUtcSuffix(epoch);
+    dbgPrintln();
+
+    char timeTok[16];
+    epochToJsonToken(epoch, timeTok, sizeof(timeTok));
+    char levelMsg[64];
+    snprintf(levelMsg, sizeof(levelMsg),
+             "{\"current_water_level\":%u,\"time\":%s}", waterLevelPct, timeTok);
     bleUart.println(levelMsg);
 
     char addNoteCmd[220];
